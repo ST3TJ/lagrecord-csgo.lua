@@ -1,472 +1,321 @@
--- Variables
-local sv_maxunlag = cvar.sv_maxunlag
+-- Либа говно, у меня лучше
+local CLagCompensation = { Data = {} }; do
+    local hitbox_connections = {
+        { 0,  1 },
+        { 1,  6 },
+        { 6,  5 },
+        { 5,  4 },
+        { 4,  3 },
+        { 3,  2 },
+        { 6,  17 },
+        { 17, 18 },
+        { 18, 14 },
+        { 6,  15 },
+        { 15, 16 },
+        { 16, 13 },
+        { 2,  8 },
+        { 8,  10 },
+        { 10, 12 },
+        { 2,  7 },
+        { 7,  9 },
+        { 9,  11 }
+    }
 
-local host_frameticks = ffi.cast('uint32_t*', utils.opcode_scan('engine.dll', '03 05 ? ? ? ? 83 CF 10', 0x2))
-local host_currentframetick = ffi.cast('uint32_t*', utils.opcode_scan('engine.dll', '2B 05 ? ? ? ? 03 05 ? ? ? ? 83 CF 10', 0x2))
+    local w2s = render.world_to_screen
 
--- Functions
-local new_class = function()
-    local mt, mt_data, this_mt = { }, { }
+    local cl_interp = cvar.cl_interp
+    local cl_updaterate = cvar.cl_updaterate
+    local sv_minupdaterate = cvar.sv_minupdaterate
+    local sv_maxupdaterate = cvar.sv_maxupdaterate
+    local cl_interp_ratio = cvar.cl_interp_ratio
+    local sv_min_interp_ratio = cvar.sv_client_min_interp_ratio
+    local sv_max_interp_ratio = cvar.sv_client_max_interp_ratio
 
-    mt.__metatable = false
-    mt_data.struct = function(self, name)
-        assert(type(name) == 'string', 'invalid class name')
-        assert(rawget(self, name) == nil, 'cannot overwrite subclass')
+    function to_ticks(time)
+        return math.ceil(time * cl_updaterate:float())
+    end
 
-        return function(data)
-            assert(type(data) == 'table', 'invalid class data')
-            rawset(self, name, setmetatable(data, {
-                __metatable = false,
-                __index = function(self, key)
-                    return
-                        rawget(mt, key) or
-                        rawget(this_mt, key)
+    function to_time(ticks)
+        return ticks / cl_updaterate:float()
+    end
+
+    function math.clamp(value, min, max)
+        return math.min(math.max(value, min), max)
+    end
+
+    function table.count(list)
+        local count = 0
+
+        for _ in pairs(list) do
+            count = count + 1
+        end
+
+        return count
+    end
+
+    ---@param alive boolean
+    ---@param enemy boolean
+    ---@param visible boolean
+    ---@return player[]
+    ---@diagnostic disable-next-line: duplicate-set-field
+    function entity.get_players(alive, enemy, visible)
+        local entity_list = { entity.get_local_player() }
+
+        for i = 1, globals.max_players do
+            local ent = entity.get(i)
+            if ent and ent:is_player() then
+                ---@cast ent player
+                if (not alive or ent:is_alive()) and
+                    (not enemy or ent:is_enemy()) and
+                    (not visible or not ent:is_dormant()) then
+                    table.insert(entity_list, ent)
                 end
-            }))
+            end
+        end
 
-            return this_mt
+        return entity_list
+    end
+
+    ---@param player player
+    ---@return vector[]
+    function CLagCompensation:GetPlayerMatrix(player)
+        local matrix = {}
+
+        for i = 0, 18 do
+            matrix[i] = player:get_hitbox_position(i)
+        end
+
+        return matrix
+    end
+
+    ---@return player_record_t
+    function CLagCompensation:ThrowEmptyData()
+        local matrix = {}
+
+        for i = 0, 18 do
+            matrix[i] = vector(0, 0, 0)
+        end
+
+        ---@class player_record_t
+        local data = {
+            Player                  = nil,
+            Tick                    = 0,
+            Matrix                  = matrix,
+            Origin                  = vector(0, 0, 0),
+            m_flSimulationTime      = 0,
+            m_flOldSimulationTime   = 0,
+            m_flMaxSimulationTime   = 0,
+            Exploiting              = false,
+            BreakingLagCompensation = false,
+            Lag                     = false,
+        }
+
+        return data
+    end
+
+    ---@param player player
+    ---@return player_record_t
+    function CLagCompensation:GetPreviousData(player)
+        local id = player:ent_index()
+
+        if not self.Data[id] then
+            return self:ThrowEmptyData()
+        end
+
+        local tick = globals.tickcount
+
+        return self.Data[id][tick - 1] or self:ThrowEmptyData()
+    end
+
+    ---@param player player
+    ---@return player_record_t
+    function CLagCompensation:Backup(player)
+        local id = player:ent_index()
+
+        if not self.Data[id] then
+            self.Data[id] = {}
+        end
+
+        local tick = globals.tickcount
+        local simulation_data = player:get_simulation_time()
+
+        local m_flSimulationTime = simulation_data[1]
+        local m_flOldSimulationTime = simulation_data[2]
+
+        local previous = self:GetPreviousData(player)
+        local m_flMaxSimulationTime = previous.m_flMaxSimulationTime
+
+        local delta = m_flSimulationTime - m_flMaxSimulationTime
+        local exploiting = delta > to_time(1)
+
+        local origin = player:get_abs_origin()
+        local distance = previous.Origin:dist(origin)
+        local teleport = distance > 64
+
+        local lag = m_flOldSimulationTime == m_flSimulationTime
+
+        self.Data[id][tick] = {
+            Player                  = player,
+            Tick                    = tick,
+            Matrix                  = self:GetPlayerMatrix(player),
+            Origin                  = player:get_abs_origin(),
+            m_flSimulationTime      = m_flSimulationTime,
+            m_flOldSimulationTime   = m_flOldSimulationTime,
+            m_flMaxSimulationTime   = math.max(m_flSimulationTime, m_flOldSimulationTime, m_flMaxSimulationTime),
+            Exploiting              = exploiting,
+            BreakingLagCompensation = teleport,
+            Lag                     = lag,
+        }
+
+        return self.Data[id][tick]
+    end
+
+    ---@param player player
+    function CLagCompensation:CollectGarbage(player)
+        local tick = globals.tickcount
+        local id = player:ent_index()
+
+        for record_tick, _ in pairs(self.Data[id]) do
+            if record_tick <= tick - 64 then
+                self.Data[id][record_tick] = nil
+            end
         end
     end
 
-    this_mt = setmetatable(mt_data, mt)
+    ---@return number
+    function CLagCompensation:GetLerpTime()
+        local update_rate = math.clamp(cl_updaterate:float(), sv_minupdaterate:float(), sv_maxupdaterate:float())
+        local interp_ratio = math.clamp(cl_interp_ratio:float(), sv_min_interp_ratio:float(), sv_max_interp_ratio:float())
 
-    return this_mt
+        return math.clamp(interp_ratio / update_rate, cl_interp:float(), 1)
+    end
+
+    ---@param record player_record_t
+    ---@return boolean
+    function CLagCompensation:IsValidRecord(record)
+        if not record or not record.Player or record.Exploiting or record.BreakingLagCompensation then
+            return false
+        end
+
+        local nci = utils.get_net_channel()
+
+        if not nci then
+            return false
+        end
+
+        local me = entity.get_local_player()
+
+        local latency = nci:get_latency(1) + nci:get_latency(0)
+        local server_tickcount = me.m_nTickBase + to_ticks(latency); -- me.m_nTickBase = ctx.corrected_tickbase ( actually, not really )
+
+        -- no no no mister penguin
+        -- if (ctx.fake_duck)
+        --     server_tickcount += 14 - ClientState->m_nChokedCommands;
+
+        local lerp_time = self:GetLerpTime();
+        local delta_time = math.clamp(latency + lerp_time, 0, cvar.sv_maxunlag:float()) -
+            (to_time(me.m_nTickBase) - record.m_flSimulationTime);
+
+        if (math.abs(delta_time) > 0.2) then
+            return false;
+        end
+
+        -- omg v0lvo broke this check but i want to add it because i want to be like Soufiw
+        local dead_time = to_time(server_tickcount) - 0.2
+        if (record.m_flSimulationTime + lerp_time < dead_time) then
+            return false
+        end
+
+        return true;
+    end
+
+    function CLagCompensation:Update()
+        local me = entity.get_local_player()
+
+        if not (me and me:is_alive()) then
+            CLagCompensation.Data = {}
+            return
+        end
+
+        local players = entity.get_players(true, true, true)
+
+        for _, player in ipairs(players) do
+            self:Backup(player)
+            self:CollectGarbage(player)
+        end
+    end
+
+    function CLagCompensation:DrawMatrix(matrix)
+        for _, connection in ipairs(hitbox_connections) do
+            local start = matrix[connection[1]]
+            local finish = matrix[connection[2]]
+
+            if start and finish then
+                local start_screen = w2s(start)
+                local finish_screen = w2s(finish)
+
+                if start_screen.x < 0 or start_screen.y < 0 or finish_screen.x < 0 or finish_screen.y < 0 then
+                    goto continue
+                end
+
+                render.line(start_screen, finish_screen, color(255, 255, 255))
+
+                ::continue::
+            end
+        end
+    end
+
+    function CLagCompensation:Draw()
+        local me = entity.get_local_player()
+        if not (me and me:is_alive()) then
+            return
+        end
+
+        local players = entity.get_players(true, true, true)
+
+        for _, player in ipairs(players) do
+            local id = player:ent_index()
+            local records = self.Data[id]
+
+            if not records then
+                goto next_player
+            end
+
+            local latest = math.huge
+
+            for _, data in pairs(records) do
+                if not self:IsValidRecord(data) then
+                    goto continue
+                end
+
+                if data.Tick < latest then
+                    latest = data.Tick
+                end
+
+                ::continue::
+            end
+
+            if latest ~= math.huge then
+                self:DrawMatrix(records[latest].Matrix)
+            end
+
+            ::next_player::
+        end
+    end
 end
 
-local insert = function(tbl, new_value)
-    local new_tbl = {}
+client.add_callback("render", function()
+    local s, m = pcall(CLagCompensation.Draw, CLagCompensation)
 
-    new_tbl[#new_tbl+1] = new_value
-
-    for _, value in pairs(tbl) do
-        if value ~= nil then
-            new_tbl[#new_tbl+1] = value
-        end
+    if not s then
+        print(m)
     end
-
-    return new_tbl
-end
-
-local evnt do (function()
-    local c_list = { }
-
-    local function register_callback(fn)
-        assert(type(fn) == 'function', 'callback has to be a function')
-
-        local already_exists = false
-
-        for _, this in pairs(c_list) do
-            if this == fn then
-                already_exists = true
-                break
-            end
-        end
-
-        if already_exists then
-            error('the function callback is already registered', 3)
-        end
-
-        table.insert(c_list, fn)
-    end
-
-    local function unregister_callback(fn)
-        assert(type(fn) == 'function', 'callback has to be a function')
-
-        for index, this in pairs(c_list) do
-            if this == fn then
-                table.remove(c_list, index)
-
-                return true
-            end
-        end
-
-        return false
-    end
-
-    local function get_list()
-        return c_list
-    end
-
-    local function fire_callback(...)
-        local output = false
-
-        for idx, callback in ipairs(c_list) do
-            local success, result = pcall(callback, ...)
-
-            if success == true and result == true then
-                output = true
-                break
-            end
-        end
-
-        return output
-    end
-
-    evnt = {
-        register = register_callback,
-        unregister = unregister_callback,
-        fire_callback = fire_callback,
-        get_list = get_list
-    }
-end)() end
-
--- Global Class
-local ctx = new_class()
-    :struct 'lagrecord' {
-        data = { },
-
-        estimated_tickbase = 0,
-        local_player_tickbase = 0,
-
-        purge = function(self, player)
-            if player == nil then
-                self.estimated_tickbase = 0
-                self.local_player_tickbase = 0
-                self.data = { }
-
-                return
-            end
-
-            self.data[player:get_index()] = { }
-        end,
-
-        track_time = function(self, cmd)
-            self.estimated_tickbase = globals.estimated_tickbase
-
-            if cmd.choked_commands == 0 then
-                self.local_player_tickbase = entity.get_local_player().m_nTickBase
-            end
-        end,
-
-        get_server_time = function(self, as_ticks)
-            local predicted_server_tick = globals.client_tick + globals.clock_offset
-
-            if host_frameticks ~= nil and host_currentframetick ~= nil then
-                local delta = host_frameticks[0] - host_currentframetick[0]
-                local max_delta_for_tick_rate = math.floor(1 / globals.tickinterval) / 8
-
-                if delta > 0 and delta < max_delta_for_tick_rate then
-                    predicted_server_tick = predicted_server_tick + delta
-                end
-            end
-
-            return as_ticks ~= true and to_time(predicted_server_tick) or predicted_server_tick
-        end,
-
-        get_player_time = function(self, player, as_tick)
-            assert(player ~= nil and player.get_simulation_time ~= nil, 'invalid player')
-
-            if player == entity.get_local_player() then
-                local m_nTickBase = self.local_player_tickbase -- player.m_nTickBase
-
-                return as_tick ~= true and to_time(m_nTickBase) or m_nTickBase
-            end
-
-            local simulation_time = player:get_simulation_time().current
-
-            return as_tick == true and
-                self:to_ticks(simulation_time) or simulation_time
-        end,
-
-        get_dead_time = function(self, as_tick)
-            local sv_maxunlag = sv_maxunlag:float()
-            local outgoing_latency = utils.net_channel().latency[0]
-            local dead_time = to_time(self.estimated_tickbase) - outgoing_latency - sv_maxunlag
-
-            return as_tick == true and to_ticks(dead_time) or dead_time
-        end,
-
-        verify_records = function(self, userptr, dead_time, is_alive)
-            if  userptr == nil or
-                userptr.records == nil or userptr.localdata == nil then
-                return
-            end
-
-            -- make sure we dont keep old records if those become invalid
-            local records, localdata = userptr.records, userptr.localdata
-            local first_rec_origin = records[1] and records[1].origin
-            local allow_updates = localdata.allow_updates
-
-            for idx, this in ipairs(records) do
-                local c_idx = idx ~= 1
-
-                if allow_updates == false then
-                    c_idx = true
-                end
-
-                if is_alive == false then
-                    rawset(records, idx, nil)
-                elseif c_idx == true and first_rec_origin then
-                    if this.simulation_time <= dead_time then
-                        -- purge current record if simulation time is too old
-                        rawset(records, idx, nil)
-                    elseif first_rec_origin:distsqr(this.origin) > 4096 then
-                        -- purge records if teleport distance is too big
-                        for i=2, #records do
-                            rawset(records, i, nil)
-                        end
-
-                        break
-                    end
-                end
-            end
-        end,
-
-        on_net_update = function(self, player, tick, dead_time)
-            assert(player ~= nil and player.get_simulation_time ~= nil, 'invalid player')
-
-            local index = player:get_index()
-            local origin = player:get_origin()
-            local is_alive = player:is_alive()
-
-            self.data[index] = self.data[index] or new_class()
-                :struct 'records' { }
-                :struct 'localdata' {
-                    allow_updates = false,
-                    updated_this_frame = false,
-                    last_animated_simulation = 0,
-                    no_entry = vector(),
-                    cycle = 0
-                }
-
-            -- preserve data
-            local user = self.data[index]
-            local records, localdata = user.records, user.localdata
-            local simulation_time = self:get_player_time(player)
-
-            -- set update state to false
-            localdata.allow_updates = evnt.fire_callback(player)
-            localdata.updated_this_frame = false
-
-            if  localdata.allow_updates == false or
-                is_alive == false or player:is_dormant() == true then
-                goto verify_records
-            end
-
-            do
-                local shifted_forwards = records[1] and
-                    math.max(0, to_ticks(records[1].simulation_time - simulation_time)) or 0
-
-                if shifted_forwards > 0 and localdata.no_entry.x == 0 then
-                    localdata.no_entry.y = shifted_forwards
-                elseif shifted_forwards <= 0 then
-                    localdata.no_entry.y = 0
-                end
-
-                localdata.cycle = records[1] and math.max(0, tick - records[1].tick - 1) or 0
-                localdata.no_entry.x = shifted_forwards
-                localdata.last_animated_simulation = simulation_time
-
-                if records[1] and simulation_time <= records[1].simulation_time then
-                    goto verify_records
-                end
-
-                -- STAGE: PLAYER_UPDATE
-                localdata.updated_this_frame = true
-
-                rawset(user, 'records', insert(records, {
-                    tick = tick,
-                    shifting = to_ticks(simulation_time) - tick - 1,
-                    elapsed = math.clamp(records[1] and (tick - records[1].tick - 1) or 0, 0, 72),
-                    choked = math.clamp(records[1] and (to_ticks(simulation_time - records[1].simulation_time) - 1) or 0, 0, 72),
-
-                    origin = origin,
-                    origin_old = records[1] and records[1].origin or origin,
-                    simulation_time = simulation_time,
-                    simulation_time_old = records[1] and records[1].simulation_time or simulation_time,
-
-                    angles = player:get_angles(),
-                    eye_position = player:get_eye_position(),
-                    volume = { player.m_vecMins, player.m_vecMaxs }
-                }))
-
-                -- invoke entity update callback
-                events.entity_update:call {
-                    tick = tick,
-                    index = index,
-                    entity = player
-                }
-            end
-
-            ::verify_records::
-
-            self:verify_records(user, dead_time, is_alive)
-        end
-    }
-
-    :struct 'output' {
-        get_player_idx = function(self, ...)
-            local va = { ... }
-
-            if #va == 0 then
-                local me = entity.get_local_player()
-
-                if me == nil then
-                    return
-                end
-
-                return me:get_index()
-            end
-
-            local va = va[1]
-            local va_type = type(va)
-
-            if va == nil or va_type == 'nil' then
-                return
-            end
-
-            if va_type == 'userdata' and va.get_index then
-                return va:get_index()
-            end
-
-            if va_type == 'userdata' or va_type == 'cdata' or va_type == 'number' then
-                local player = entity.get(va)
-
-                if player == nil then
-                    return
-                end
-
-                return player:get_index()
-            end
-
-            return nil
-        end,
-
-        get_player_data = function(self, ...)
-            local index = self:get_player_idx(...)
-
-            if index == nil then
-                return
-            end
-
-            local data = self.lagrecord.data[index]
-
-            if data == nil or data.localdata == nil or data.records == nil then
-                return
-            end
-
-            return data
-        end,
-
-        get_all = function(self, ...)
-            local data = self:get_player_data(...)
-
-            if data == nil then
-                return
-            end
-
-            return data.records
-        end,
-
-        get_record = function(self, ...)
-            local data = self:get_player_data(...)
-
-            if data == nil then
-                return
-            end
-
-            return data.records[({ ... })[2] or 1]
-        end,
-
-        get_snapshot = function(self, ...)
-            local data = self:get_player_data(...)
-
-            if data == nil then
-                return
-            end
-
-            local record_at = ({ ... })[2] or 1
-            local record = data.records[record_at]
-
-            if record == nil then
-                return
-            end
-
-            return {
-                id = record_at,
-                tick = record.tick,
-                updated_this_frame = data.localdata.updated_this_frame,
-
-                origin = {
-                    angles = record.angles,
-                    volume = record.volume,
-                    current = record.origin,
-                    previous = record.origin_old,
-                    change = record.origin:distsqr(record.origin_old)
-                },
-
-                simulation_time = {
-                    animated = data.localdata.last_animated_simulation,
-                    current = record.simulation_time,
-                    previous = record.simulation_time_old,
-                    change = record.simulation_time - record.simulation_time_old
-                },
-
-                command = {
-                    elapsed = record.elapsed,
-                    choke = record.choked,
-                    cycle = data.localdata.cycle,
-                    shifting = record.shifting,
-                    no_entry = data.localdata.no_entry,
-                }
-            }, record
-        end,
-
-        get_server_time = function(self, ...)
-            return self.lagrecord:get_server_time(...)
-        end
-    }
-
--- Callbacks
-events.level_init:set(function() ctx.lagrecord:purge() end)
-events.createmove:set(function(cmd) ctx.lagrecord:track_time(cmd) end)
-events.net_update_end:set(function()
-    local lagrecord = ctx.lagrecord
-
-    local me = entity.get_local_player()
-    local tick = lagrecord:get_server_time(true)
-    local dead_time = lagrecord:get_dead_time(false)
-
-    if me == nil or globals.is_in_game == false then
-        lagrecord:purge()
-        return
-    end
-
-    if me:is_alive() == false then
-        lagrecord.estimated_tickbase = globals.client_tick + globals.clock_offset
-    end
-
-    entity.get_players(false, true, function(player)
-        lagrecord:on_net_update(player, tick, dead_time)
-    end)
 end)
 
-return {
-    set_update_callback = function(...)
-        return evnt.register(...)
-    end,
+client.add_callback("createmove", function()
+    local s, m = pcall(CLagCompensation.Update, CLagCompensation)
 
-    unset_update_callback = function(...)
-        return evnt.unregister(...)
-    end,
-
-    get_player_data = function(...)
-        return ctx.output:get_player_data(...)
-    end,
-
-    get_all = function(...)
-        return ctx.output:get_all(...)
-    end,
-
-    get_record = function(...)
-        return ctx.output:get_record(...)
-    end,
-
-    get_snapshot = function(...)
-        return ctx.output:get_snapshot(...)
-    end,
-
-    get_server_time = function(...)
-        return ctx.output:get_server_time(...)
+    if not s then
+        print(m)
     end
-}
+end)
